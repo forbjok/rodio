@@ -16,7 +16,7 @@ use crate::Sample;
 pub fn mixer<S>(
     channels: u16,
     sample_rate: u32,
-) -> (Arc<DynamicMixerController<S>>, DynamicMixer<S>)
+) -> (Arc<DynamicMixerController<S>>, Arc<Mutex<DynamicMixer<S>>>)
 where
     S: Sample + Send + 'static,
 {
@@ -27,10 +27,10 @@ where
         sample_rate,
     });
 
-    let output = DynamicMixer {
+    let output = Arc::new(Mutex::new(DynamicMixer {
         current_sources: Vec::with_capacity(16),
         input: input.clone(),
-    };
+    }));
 
     (input, output)
 }
@@ -156,6 +156,8 @@ mod tests {
         tx.add(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]));
         tx.add(SamplesBuffer::new(1, 48000, vec![5i16, 5, 5, 5]));
 
+        let mut rx = rx.lock().unwrap();
+
         assert_eq!(rx.channels(), 1);
         assert_eq!(rx.sample_rate(), 48000);
         assert_eq!(rx.next(), Some(15));
@@ -171,6 +173,8 @@ mod tests {
 
         tx.add(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]));
         tx.add(SamplesBuffer::new(1, 48000, vec![5i16, 5, 5, 5]));
+
+        let mut rx = rx.lock().unwrap();
 
         assert_eq!(rx.channels(), 2);
         assert_eq!(rx.sample_rate(), 48000);
@@ -192,6 +196,8 @@ mod tests {
         tx.add(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]));
         tx.add(SamplesBuffer::new(1, 48000, vec![5i16, 5, 5, 5]));
 
+        let mut rx = rx.lock().unwrap();
+
         assert_eq!(rx.channels(), 1);
         assert_eq!(rx.sample_rate(), 96000);
         assert_eq!(rx.next(), Some(15));
@@ -207,6 +213,8 @@ mod tests {
     #[test]
     fn start_afterwards() {
         let (tx, mut rx) = dynamic_mixer::mixer(1, 48000);
+
+        let mut rx = rx.lock().unwrap();
 
         tx.add(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]));
 

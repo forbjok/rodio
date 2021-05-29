@@ -1,20 +1,27 @@
 use std::io::{Read, Seek};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::JoinHandle;
 use std::{error, fmt};
 
 use crate::decoder;
-use crate::dynamic_mixer::{self, DynamicMixerController};
+use crate::dynamic_mixer::{self, DynamicMixer, DynamicMixerController};
 use crate::sink::Sink;
 use crate::source::Source;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
+
+struct StreamWrapper(cpal::Stream);
+
+unsafe impl Send for StreamWrapper {}
 
 /// `cpal::Stream` container. Also see the more useful `OutputStreamHandle`.
 ///
 /// If this is dropped playback will end & attached `OutputStreamHandle`s will no longer work.
 pub struct OutputStream {
     mixer: Arc<DynamicMixerController<f32>>,
-    _stream: cpal::Stream,
+    mixer_rx: Arc<Mutex<DynamicMixer<f32>>>,
+    stream: Arc<Mutex<Option<StreamWrapper>>>,
+    recovery_thread: JoinHandle<()>,
 }
 
 /// More flexible handle to a `OutputStream` that provides playback.
@@ -23,14 +30,63 @@ pub struct OutputStreamHandle {
     mixer: Weak<DynamicMixerController<f32>>,
 }
 
+fn find_device_by_name(name: &str) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    let device = host.output_devices().and_then(|devices| Ok(devices.filter(|d| d.name().unwrap() == name))).unwrap().next();
+
+    device
+}
+
 impl OutputStream {
     /// Returns a new stream & handle using the given output device.
     pub fn try_from_device(
         device: &cpal::Device,
     ) -> Result<(Self, OutputStreamHandle), StreamError> {
-        let (mixer, _stream) = device.try_new_output_stream()?;
-        _stream.play()?;
-        let out = Self { mixer, _stream };
+        let device_name = device.name().unwrap();
+
+        // Determine the format to use for the new stream.
+        let format = device.default_output_config()?;
+
+        let (mixer, mixer_rx) =
+            dynamic_mixer::mixer::<f32>(format.channels(), format.sample_rate().0);
+
+        let (device_broken, stream) = device.new_output_stream_with_format(format.clone(), mixer_rx.clone())?;
+        stream.play()?;
+
+        let stream = Arc::new(Mutex::new(Some(StreamWrapper(stream))));
+
+        let recovery_thread = {
+            let mixer_rx = mixer_rx.clone();
+            let stream = stream.clone();
+
+            // Spawn recovery thread
+            std::thread::spawn(move || {
+                let mut device_broken = device_broken;
+
+                let mg = Mutex::new(());
+                loop {
+                    let _ = device_broken.wait(mg.lock().unwrap());
+
+                    dbg!("BROKEN!");
+
+                    loop {
+                        if let Some(new_device) = find_device_by_name(&device_name) {
+                            if let Ok((new_device_broken, new_stream)) = new_device.new_output_stream_with_format(format.clone(), mixer_rx.clone()) {
+                                if new_stream.play().is_ok() {
+                                    dbg!("FIXED!");
+                                    device_broken = new_device_broken;
+                                    stream.lock().unwrap().replace(StreamWrapper(new_stream));
+
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        let out = Self { mixer, mixer_rx, stream, recovery_thread };
         let handle = OutputStreamHandle {
             mixer: Arc::downgrade(&out.mixer),
         };
@@ -179,29 +235,33 @@ pub(crate) trait CpalDeviceExt {
     fn new_output_stream_with_format(
         &self,
         format: cpal::SupportedStreamConfig,
-    ) -> Result<(Arc<DynamicMixerController<f32>>, cpal::Stream), cpal::BuildStreamError>;
-
-    fn try_new_output_stream(
-        &self,
-    ) -> Result<(Arc<DynamicMixerController<f32>>, cpal::Stream), StreamError>;
+        mixer_rx: Arc<Mutex<DynamicMixer<f32>>>,
+    ) -> Result<(Arc<Condvar>, cpal::Stream), cpal::BuildStreamError>;
 }
 
 impl CpalDeviceExt for cpal::Device {
     fn new_output_stream_with_format(
         &self,
         format: cpal::SupportedStreamConfig,
-    ) -> Result<(Arc<DynamicMixerController<f32>>, cpal::Stream), cpal::BuildStreamError> {
-        let (mixer_tx, mut mixer_rx) =
-            dynamic_mixer::mixer::<f32>(format.channels(), format.sample_rate().0);
+        mixer_rx: Arc<Mutex<DynamicMixer<f32>>>,
+    ) -> Result<(Arc<Condvar>, cpal::Stream), cpal::BuildStreamError> {
+        let device_broken = Arc::new(Condvar::new());
 
-        let error_callback = |err| eprintln!("an error occurred on output stream: {}", err);
+        let error_callback = {
+            let device_broken = device_broken.clone();
+
+            move |err| {
+                eprintln!("an error occurred on output stream: {}", err);
+                device_broken.notify_one();
+            }
+        };
 
         match format.sample_format() {
             cpal::SampleFormat::F32 => self.build_output_stream::<f32, _, _>(
                 &format.config(),
                 move |data, _| {
                     data.iter_mut()
-                        .for_each(|d| *d = mixer_rx.next().unwrap_or(0f32))
+                        .for_each(|d| *d = mixer_rx.lock().unwrap().next().unwrap_or(0f32))
                 },
                 error_callback,
             ),
@@ -209,7 +269,7 @@ impl CpalDeviceExt for cpal::Device {
                 &format.config(),
                 move |data, _| {
                     data.iter_mut()
-                        .for_each(|d| *d = mixer_rx.next().map(|s| s.to_i16()).unwrap_or(0i16))
+                        .for_each(|d| *d = mixer_rx.lock().unwrap().next().map(|s| s.to_i16()).unwrap_or(0i16))
                 },
                 error_callback,
             ),
@@ -218,6 +278,7 @@ impl CpalDeviceExt for cpal::Device {
                 move |data, _| {
                     data.iter_mut().for_each(|d| {
                         *d = mixer_rx
+                            .lock().unwrap()
                             .next()
                             .map(|s| s.to_u16())
                             .unwrap_or(u16::max_value() / 2)
@@ -226,24 +287,7 @@ impl CpalDeviceExt for cpal::Device {
                 error_callback,
             ),
         }
-        .map(|stream| (mixer_tx, stream))
-    }
-
-    fn try_new_output_stream(
-        &self,
-    ) -> Result<(Arc<DynamicMixerController<f32>>, cpal::Stream), StreamError> {
-        // Determine the format to use for the new stream.
-        let default_format = self.default_output_config()?;
-
-        self.new_output_stream_with_format(default_format)
-            .or_else(|err| {
-                // look through all supported formats to see if another works
-                supported_output_formats(self)?
-                .filter_map(|format| self.new_output_stream_with_format(format).ok())
-                .next()
-                // return original error if nothing works
-                .ok_or(StreamError::BuildStreamError(err))
-            })
+        .map(|stream| (device_broken, stream))
     }
 }
 
